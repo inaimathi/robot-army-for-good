@@ -53,4 +53,6 @@ Until there’s a real release, the rough plan is:
 git clone https://github.com/<your-username>/robot-army-for-good.git
 cd robot-army-for-good
 
-# TODO: install CLI / run first agent
+# TODO: this doesn't seem to work currently - gets stuck
+python3 robot-army-for-good/rafg.py test jqlang/jq src/compile.c:gen_and
+```
