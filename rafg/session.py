@@ -32,12 +32,14 @@ def _github_clone(session_repo_dir: str, org: str, project: str) -> str:
     subprocess.run(["git", "clone", f"https://github.com/{org}/{project}.git", f"{session_repo_dir}/{project}"], check=True)
     return f"{session_repo_dir}/{project}"
 
-def _create_codex_rollout(session_dir: str, session_id: str, apparent_project_dir: str, session_project_dir: str) -> None:
+def _create_codex_rollout(session_dir: str, session_id: str, apparent_project_dir: str, session_project_dir: str) -> str:
     """
     Create a stub Codex rollout in the specified session directory.
 
     The apparent_project_dir is the directory where the project will be mounted when Codex runs.
     This is not the same as the session project dir.
+
+    Returns the git hash (we'll need that later)
     """
     if os.path.exists(f"{session_dir}/rollout.jsonl"):
         raise FileExistsError(f"Codex rollout file already exists: {session_dir}/rollout.jsonl")
@@ -70,6 +72,8 @@ def _create_codex_rollout(session_dir: str, session_id: str, apparent_project_di
 
     with open(f"{session_dir}/rollout.jsonl", "w") as f:
         f.write(f"{line0}\n")
+
+    return git_commit_hash
 
 def _datetime_from_session_id(session_id: str) -> datetime:
     """
@@ -148,7 +152,7 @@ def session_new(github_project: str) -> str:
     session_project_dir = _github_clone(session_repo_dir, org, project)
     home_dir = os.path.expanduser("~")
     apparent_project_dir = f"{home_dir}/repo/{project}"
-    _create_codex_rollout(session_dir, session_id, apparent_project_dir, session_project_dir)
+    github_hash = _create_codex_rollout(session_dir, session_id, apparent_project_dir, session_project_dir)
     _install_codex_rollout(session_dir, session_id)
     os.makedirs(f"{session_dir}/tmp", exist_ok=True)
     dt = _datetime_from_session_id(session_id)
@@ -157,6 +161,7 @@ def session_new(github_project: str) -> str:
             "timestamp": dt.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "github_owner": org,
             "github_project": project,
+            "github_hash": github_hash,
             "session_id": session_id,
             "cwd": apparent_project_dir,
             "parent": None
@@ -241,12 +246,12 @@ cat {session_dir}/cmd | sudo -u ubuntu codex --ask-for-approval never exec --san
         print("Copying updated Codex rollout back to session directory")
         _copy_codex_rollout_back(session_dir, session_id)
     
-if __name__ == "__main__":
-    # check it works
-    parent_id = session_new("jqlang/jq")
-    print("Created session:", parent_id)
-    session_run(parent_id, "Create a file named hello.txt with the content 'Hello, World!'\n")
-    child_id = session_clone(parent_id)
-    print("Cloned session:", child_id)
-    session_run(child_id, "Append the text 'This is a cloned session.' to hello.txt\n")
-    print(f"Original session id: {parent_id}. Cloned session id: {child_id}.")
+# if __name__ == "__main__":
+#     # check it works
+#     parent_id = session_new("jqlang/jq")
+#     print("Created session:", parent_id)
+#     session_run(parent_id, "Create a file named hello.txt with the content 'Hello, World!'\n")
+#     child_id = session_clone(parent_id)
+#     print("Cloned session:", child_id)
+#     session_run(child_id, "Append the text 'This is a cloned session.' to hello.txt\n")
+#     print(f"Original session id: {parent_id}. Cloned session id: {child_id}.")
