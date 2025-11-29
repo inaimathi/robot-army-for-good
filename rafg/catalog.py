@@ -1,6 +1,6 @@
 import os
 
-from rafg.session import session_new, session_clone, session_run
+from rafg.session import session_new, session_clone, session_run, session_finished
 
 def _catalog_root() -> str:
     return os.path.expanduser("~/catalog")
@@ -44,25 +44,35 @@ def catalog_build(github_project: str) -> None:
         f.write("true")
     print(f"Completed building catalog entry for {github_project}")
 
-def catalog_test(github_project: str, function: str) -> None:
+def catalog_test(github_project: str, filename: str) -> None:
     owner, repo = github_project.split("/")
-    filename, function_name = function.split(":")
 
     catalog_dir = f"{_catalog_root()}/{owner}/{repo}"
-    function_file = f"{catalog_dir}/test/{filename}/{function_name}"
+    session_id_file = f"{catalog_dir}/test/{filename}.txt"
     if not os.path.exists(f"{catalog_dir}/build/built"):
         raise FileNotFoundError(f"Catalog entry is not built: {catalog_dir}")
-    if os.path.exists(function_file):
-        raise FileExistsError(f"Catalog test function already exists: {function_file}")
+
+    if os.path.exists(session_id_file):
+        print(f"Tests have already begun for file {filename} in project {github_project}")
+        with open(session_id_file, "r") as f:
+            session_id = f.read().strip()
+
+        if session_finished(session_id):
+            raise Exception(f"Session {session_id} has already finished all tests for file {filename}.")
+        print(f"Resuming tests in existing session {session_id}...")
+        instructions = _get_command("theft_continue", filename)
+    else:
+        with open(f"{catalog_dir}/build/session_id", "r") as f:
+            old_session_id = f.read().strip()
+        session_id = session_clone(old_session_id)
+        print(f"Cloned session {old_session_id} to new session {session_id} for testing file {filename}")
+        os.makedirs(os.path.dirname(session_id_file), exist_ok=True)
+        with open(session_id_file, "w") as f:
+            f.write(session_id)
+        instructions = _get_command("theft", filename)
     
-    with open(f"{catalog_dir}/build/session_id", "r") as f:
-        old_session_id = f.read().strip()
-    new_session_id = session_clone(old_session_id)
-    print(f"Cloned session {old_session_id} to new session {new_session_id} for testing function {function}")
-    
-    instructions = _get_command("theft", f"{filename} {function_name}")
-    session_run(new_session_id, instructions)
-    os.makedirs(os.path.dirname(function_file), exist_ok=True)
-    with open(function_file, "w") as f:
-        f.write(new_session_id)
-    print(f"Completed testing function {function} for {github_project} with session ID: {new_session_id}")
+    session_run(session_id, instructions)
+
+    print(f"Completed this round of testing for file {filename} for {github_project} with session ID: {session_id}")
+    if session_finished(session_id):
+        print(f"Session {session_id} has finished all tests.")

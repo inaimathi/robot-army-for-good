@@ -255,3 +255,17 @@ cat {session_dir}/cmd | sudo -u ubuntu codex --ask-for-approval never exec --san
 #     print("Cloned session:", child_id)
 #     session_run(child_id, "Append the text 'This is a cloned session.' to hello.txt\n")
 #     print(f"Original session id: {parent_id}. Cloned session id: {child_id}.")
+
+def session_finished(session_id: str) -> bool:
+    """
+    Check if the specified Robot Army For Good session is finished.
+
+    A session is considered finished if its project contains a file named "FINISHED".
+    """
+    session_dir = f"{_sessions_root()}/{session_id}"
+    if not os.path.exists(session_dir):
+        raise FileNotFoundError(f"Session directory not found: {session_dir}")
+    with open(f"{session_dir}/config", "r") as f:
+        config = json.load(f)
+    session_project_dir = f"{session_dir}/repo/{config['github_project']}"
+    return os.path.exists(f"{session_project_dir}/FINISHED")
