@@ -1,1 +1,1 @@
-trivialai
+trivialai[all]
