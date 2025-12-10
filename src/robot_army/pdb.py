@@ -88,20 +88,44 @@ def run_pdb_test(path: str):
             toolbox.spit,
             make_run_repo_tests_tool(path),
         ],
-        name="pdb_agent_002",
+        name="pdb_agent_003",
     )
 
     def _check_resp(resp: str) -> dict[str, Any]:
-        parsed = util.loadch(resp)
-        if parsed.get("type") not in {"summary", "conclusion", "tool-call"}:
-            raise util.TransformError("invalid-object-structure")
-        if parsed["type"] == "tool-call":
-            return agent.check_tool(parsed)
-        return parsed
+        """
+        Parse a model response into a multi-object envelope:
+
+            {
+              "type": "multi",
+              "items": [ {...}, {...}, ... ]
+            }
+
+        Each item must be a dict with type in {"summary", "conclusion", "tool-call"}.
+        Tool-calls are passed through agent.check_tool for validation.
+        """
+        objs = util.loadchmulti(resp)
+
+        items: list[dict[str, Any]] = []
+        for obj in objs:
+            if not isinstance(obj, dict):
+                raise util.TransformError("invalid-object-structure")
+
+            ptype = obj.get("type")
+            if ptype not in {"summary", "conclusion", "tool-call"}:
+                raise util.TransformError("invalid-object-structure")
+
+            if ptype == "tool-call":
+                items.append(agent.check_tool(obj))
+            else:
+                items.append(obj)
+
+        return {"type": "multi", "items": items}
 
     def _per_file_stream(f: str):
-        tool_calls = []
-        test_results = None
+        tool_calls: list[tuple[dict[str, Any], Any]] = []
+        test_results: dict[str, Any] | None = None
+        summaries: list[str] = []
+
         prompt = Template(util.slurp("resources/pdb_file_prompt.md")).safe_substitute(
             repo_path=path,
             files=files,
@@ -111,50 +135,130 @@ def run_pdb_test(path: str):
 
         base = agent.stream_checked(_check_resp, prompt)
 
+        def handle_tool_call(parsed: dict[str, Any]):
+            nonlocal test_results
+
+            res = agent.call_tool(parsed)
+
+            if parsed.get("tool") == "run_repo_tests":
+                test_results = res
+            else:
+                tool_calls.append((parsed, res))
+
+            agent.log(
+                {
+                    "type": "trivialai.agent.log",
+                    "message": f"Running a tool call {parsed} -> {type(res)}",
+                }
+            )
+
+        def handle_summaries(new_items: list[dict[str, Any]]):
+            """
+            Collect any 'summary' items into the summaries journal.
+            Returns True if we observed at least one new summary.
+            """
+            saw_any = False
+            for item in new_items:
+                if item.get("type") == "summary":
+                    summary_text = item.get("summary") or ""
+                    summaries.append(summary_text)
+                    saw_any = True
+            return saw_any
+
         def _proceed(final_ev: dict[str, Any]):
-            parsed = final_ev.get("parsed", {})
+            nonlocal test_results
 
-            if parsed.get("type") == "tool-call":
-                res = agent.call_tool(parsed)
-                if parsed.get("tool") == "run_repo_tests":
-                    nonlocal test_results
-                    test_results = res
-                else:
-                    tool_calls.append((parsed, res))
-                agent.log(
-                    {
-                        "type": "trivialai.agent.log",
-                        "message": f"Running a tool call {parsed} -> {type(res)}",
-                    }
+            parsed = final_ev.get("parsed") or {}
+            # Backwards-compat: if parsed is not our "multi" envelope,
+            # treat it as a single-item list.
+            if parsed.get("type") == "multi" and "items" in parsed:
+                items: list[dict[str, Any]] = parsed["items"] or []
+            else:
+                # Single-object path (older agents / tests)
+                items = [parsed] if isinstance(parsed, dict) else []
+
+            if not items:
+                # Nothing to do; let repeat_until drive another iteration.
+                return
+
+            # Process everything in order.
+            saw_conclusion = any(it.get("type") == "conclusion" for it in items)
+
+            # First: handle all tool calls
+            for it in items:
+                if it.get("type") == "tool-call":
+                    handle_tool_call(it)
+
+            # Second: collect summaries
+            saw_summary = handle_summaries(items)
+
+            # If we saw a conclusion, we *do not* schedule another LLM pass.
+            # repeat_until(stop=...) will see this and end the loop.
+            if saw_conclusion:
+                return
+
+            # Otherwise, craft a follow-up prompt that reflects
+            # all current tool_calls, summaries, and latest test results.
+            calls_txt = "\n\n".join(
+                f"You previously asked me to run the tool call {pc}. "
+                f"The result of that call was:\n```json\n{r}\n```"
+                for pc, r in tool_calls
+            )
+
+            tests_txt = (
+                "The most recent test run result is:\n" f"```json\n{test_results}\n```"
+                if test_results is not None
+                else "You have not run the repository tests yet for this file."
+            )
+
+            if summaries:
+                journal_txt = "\n\n---\n\n".join(
+                    f"Summary {i+1}:\n{txt}" for i, txt in enumerate(summaries)
+                )
+                summaries_section = (
+                    f"So far, you have recorded the following progress summaries "
+                    f"for {f}:\n\n{journal_txt}\n\n"
+                )
+            else:
+                summaries_section = (
+                    f"You have not yet provided any progress summaries for {f}.\n\n"
                 )
 
-                calls = "\n\n".join(
-                    [
-                        f"You previously asked me to run the tool call {parsed}. THe result of that call was {res}"
-                        for parsed, res in tool_calls
-                    ]
-                )
+            guidance = (
+                "Use the test results (if any), your previous tool calls, and your current\n"
+                "understanding to either:\n"
+                "- write or refine more property-based tests, or\n"
+                "- identify and explain concrete bugs, or\n"
+                "- when you are genuinely finished with this file, respond with a JSON\n"
+                "  object of the form:\n"
+                '    {"type": "conclusion", "summary": MarkdownString}\n\n'
+            )
 
-                tests = (
-                    f"The most recent test results are: {test_results}\n"
-                    if test_results is not None
-                    else ""
-                )
-                pr = f"{calls}\n{tests}\n{prompt}\n"
+            pr = (
+                f"{summaries_section}"
+                f"{tests_txt}\n\n"
+                f"{calls_txt}\n\n"
+                f"{guidance}"
+                f"{prompt}\n"
+            )
 
-                yield from agent.stream_checked(_check_resp, pr)
+            # Schedule exactly one more LLM pass with the updated prompt.
+            yield from agent.stream_checked(_check_resp, pr)
 
-            # For parsed["type"] == "summary" we don't do anything here.
-            # repeat_until will notice the summary and stop scheduling more passes.
-
-        # Repeatedly run LLM -> tool -> LLM until we see a summary in parsed["type"]
+        # Repeatedly run LLM -> tools -> LLM until we see a conclusion in parsed["items"].
         return repeat_until(
             base,
             _proceed,
             pred=lambda ev: isinstance(ev, dict) and ev.get("type") == "final",
-            stop=lambda final_ev, i: final_ev.get("parsed", {}).get("type")
-            == "conclusion",
-            max_iters=10,  # or whatever upper bound you like
+            stop=lambda final_ev, i: any(
+                (it.get("type") == "conclusion")
+                for it in (
+                    (final_ev.get("parsed") or {}).get("items", [])
+                    if (final_ev.get("parsed") or {}).get("type") == "multi"
+                    else [final_ev.get("parsed") or {}]
+                )
+            ),
+            max_iters=10,
         )
 
     # Top-level: flatten per-file streams
