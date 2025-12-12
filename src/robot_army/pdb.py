@@ -1,4 +1,7 @@
+import json
+import os.path
 import subprocess
+import sys
 from os import environ as ENV
 from pathlib import Path
 from string import Template
@@ -9,6 +12,8 @@ from trivialai.agent import toolbox, toolkit
 from trivialai.agent.core import Agent
 from trivialai.bistream import force, repeat_until
 
+from . import prepare
+
 # LLM = ollama.Ollama("deepseek-r1:1.5b", "http://localhost:11434/")
 # LLM = ollama.Ollama("qwq:latest", "http://localhost:11435/")
 LLM = bedrock.Bedrock(
@@ -16,7 +21,13 @@ LLM = bedrock.Bedrock(
     region="us-east-1",
     aws_access_key_id=ENV["AWS_ACCESS_KEY"],
     aws_secret_access_key=ENV["AWS_ACCESS_SECRET"],
+    max_tokens=8192,
 )
+
+
+def main():
+    gen = run_pdb_test(str(Path("~/projects/pycronado/").expanduser().resolve()))
+    return force(gen)
 
 
 def make_run_repo_tests_tool(repo_root: str):
@@ -34,9 +45,10 @@ def make_run_repo_tests_tool(repo_root: str):
           - stdout: captured test runner stdout (may be truncated)
           - stderr: captured test runner stderr (may be truncated)
         """
+        python = os.path.join(repo_root, "venv-robot_army", "bin", "python")
         try:
             proc = subprocess.run(
-                ["sh", "unittest.sh"],
+                [python, "-m", "unittest", "discover", "-s", "tests"],
                 cwd=repo_root,
                 capture_output=True,
                 text=True,
@@ -70,12 +82,8 @@ def make_run_repo_tests_tool(repo_root: str):
     return run_repo_tests
 
 
-def main():
-    gen = run_pdb_test(str(Path("~/projects/pycronado/").expanduser().resolve()))
-    return force(gen)
-
-
 def run_pdb_test(path: str):
+    repo_root = path
     files = toolbox.code_ls(path)
     src_files = [f for f in files if f.endswith(".py")]
 
@@ -88,8 +96,12 @@ def run_pdb_test(path: str):
             toolbox.spit,
             make_run_repo_tests_tool(path),
         ],
-        name="pdb_agent_003",
+        name="pdb_agent_008",
     )
+
+    def report_path(src_file_path):
+        rel = str(Path(src_file_path).relative_to(Path(repo_root)))
+        return agent.filepath(f"report_{rel.replace('/', '_')}.md")
 
     def _check_resp(resp: str) -> dict[str, Any]:
         """
@@ -152,18 +164,16 @@ def run_pdb_test(path: str):
                 }
             )
 
-        def handle_summaries(new_items: list[dict[str, Any]]):
-            """
-            Collect any 'summary' items into the summaries journal.
-            Returns True if we observed at least one new summary.
-            """
-            saw_any = False
-            for item in new_items:
-                if item.get("type") == "summary":
-                    summary_text = item.get("summary") or ""
-                    summaries.append(summary_text)
-                    saw_any = True
-            return saw_any
+        def handle_summary(ev):
+            summary_text = ev.get("summary") or ""
+            if summary_text:
+                util.spit(agent.filepath("summaries.md"), summary_text, mode="a")
+                util.spit(agent.filepath("summaries.md"), "\n - - -\n\n", mode="a")
+            summaries.append(summary_text)
+
+        def handle_conclusion(ev):
+            util.spit(report_path(f), ev["summary"])
+            return True
 
         def _proceed(final_ev: dict[str, Any]):
             nonlocal test_results
@@ -186,11 +196,12 @@ def run_pdb_test(path: str):
 
             # First: handle all tool calls
             for it in items:
+                if it.get("type") == "summary":
+                    handle_summary(it)
                 if it.get("type") == "tool-call":
                     handle_tool_call(it)
-
-            # Second: collect summaries
-            saw_summary = handle_summaries(items)
+                if it.get("type") == "conclusion":
+                    util.spit(report_path(f), json.dumps(it))
 
             # If we saw a conclusion, we *do not* schedule another LLM pass.
             # repeat_until(stop=...) will see this and end the loop.
@@ -258,7 +269,7 @@ def run_pdb_test(path: str):
                     else [final_ev.get("parsed") or {}]
                 )
             ),
-            max_iters=10,
+            max_iters=15,
         )
 
     # Top-level: flatten per-file streams

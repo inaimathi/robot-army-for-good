@@ -5,7 +5,7 @@ For this file, you should work in an iterative loop:
 
   1. Read the implementation and any existing tests using the available tools.
   2. Propose and write additional tests (for Python: property-based tests with Hypothesis)
-     into appropriate test files.
+     into appropriate test files. IMPORTANT: Do not propose tests that contain sleep calls (the tests will be run with a 300 second timeout, and introducing any sleeps might cause that guard rail to trip)
   3. When you have written or modified tests, call the repository test-running tool
      (for example `run_repo_tests`) to execute the test suite.
   4. Read and analyze the test results. Use them to refine your understanding, fix or
@@ -19,6 +19,10 @@ Your responses MUST always be one of the following JSON objects:
      matching the tool-calling shape shown below (and nothing else):
 
      $tool_shape
+	 
+	 Note that your context window is limited, so you can't _really_ write files of arbitrary
+	 sizes. If you need to use the `spit` tool to write a large file, call it multiple times
+	 with the `"mode"` argument set to `"a"` in order to append.
 
   2. An intermediate summary of your progress so far for this file, when you want to
      document what you have done but CONTINUE working after this step. In this case your
