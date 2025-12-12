@@ -6,6 +6,14 @@
 
 ---
 
+TODO
+
+1. set up repo
+2. for each file, do the testing/gathering routine
+3. once the routine is done, read all the reports and summarize them into a final report.
+4. second guess all found bugs, recommend the ones you remain confident about
+5. for each bug, find the minimum reproducing case
+
 ## What is this?
 
 **Robot Army For Good** is an experiment in scaling up automated bug-hunting.

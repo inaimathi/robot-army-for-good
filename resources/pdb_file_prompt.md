@@ -1,3 +1,11 @@
+Use the test results (if any), your previous tool calls, and your current
+understanding to either:
+- write or refine more property-based tests, or
+- identify and explain concrete bugs, or
+- when you are genuinely finished with this file, respond with a JSON
+  object of the form:
+    {"type": "conclusion", "summary": MarkdownString}
+
 Find bugs in the repository $repo_path. The relevant file tree in the repo is $files.
 You are currently working on file $file_path.
 
