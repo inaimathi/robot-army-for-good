@@ -1,22 +1,20 @@
+# pdb_runner.py
 import json
 import os.path
 import subprocess
-import sys
 from os import environ as ENV
 from pathlib import Path
 from string import Template
 from typing import Any
 
-from trivialai import bedrock, ollama, util
-from trivialai.agent import toolbox, toolkit
+from trivialai import bedrock, util
+from trivialai.agent import toolbox
 from trivialai.agent.core import Agent
-from trivialai.bistream import force, isType, repeat_until
+from trivialai.bistream import BiStream, force, isType, repeat_until
 from trivialai.log import getLogger
 
-from . import prepare
+logger = getLogger("robot_army.pdb")
 
-# LLM = ollama.Ollama("deepseek-r1:1.5b", "http://localhost:11434/")
-# LLM = ollama.Ollama("qwq:latest", "http://localhost:11435/")
 LLM = bedrock.Bedrock(
     model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
     region="us-east-1",
@@ -24,8 +22,6 @@ LLM = bedrock.Bedrock(
     aws_secret_access_key=ENV["AWS_ACCESS_SECRET"],
     max_tokens=8192,
 )
-
-logger = getLogger("robot_army.pdb")
 
 
 def main():
@@ -90,14 +86,9 @@ class PDBAgent(Agent):
         super().__init__(llm, *args, **kwargs)
         self.repo_root = repo_root
 
-    def check_resp(self, resp: str) -> dict[str, Any]:
+    def check_resp(self, resp: str) -> list[dict[str, Any]]:
         """
-        Parse a model response into a multi-object envelope:
-
-            {
-              "type": "multi",
-              "items": [ {...}, {...}, ... ]
-            }
+        Parse a model response into a list of items.
 
         Each item must be a dict with type in {"summary", "conclusion", "tool-call"}.
         Tool-calls are passed through agent.check_tool for validation.
@@ -120,35 +111,47 @@ class PDBAgent(Agent):
 
         return items
 
-    def spit_summary(self, text):
+    def spit_summary(self, text: str) -> None:
         delimiter = "\n - - -\n\n"
         util.spit(self.filepath("summaries.md"), text, mode="a")
         util.spit(self.filepath("summaries.md"), delimiter, mode="a")
 
-    def spit_report(self, origin_path, report):
+    def spit_report(self, origin_path: str, report: str) -> None:
         rel = str(Path(origin_path).relative_to(Path(self.repo_root)))
         path = self.filepath(f"report_{rel.replace('/', '_')}.md")
         util.spit(path, report)
 
-    def streamed(self, prompt):
+    def _streamed(self, prompt: str):
+        """
+        "Full streamy" surface: yield ONLY parsed items (summary/conclusion/tool-call).
+
+        All other low-level events (start/end/delta/final envelope) are intentionally
+        not bubbled up here.
+        """
         for ev in self.stream_checked(self.check_resp, prompt):
             if (
                 isinstance(ev, dict)
                 and ev.get("ok")
                 and isinstance(ev.get("parsed"), list)
-                and all(
-                    isinstance(el, dict) and el.get("type") is not None
-                    for el in ev["parsed"]
-                )
             ):
-                yield from ev["parsed"]
+                parsed = ev["parsed"]
+                if all(
+                    isinstance(el, dict) and el.get("type") is not None for el in parsed
+                ):
+                    yield from parsed
+                else:
+                    raise util.TransformError("invalid-parsed-structure")
+            yield ev
+
+    def streamed(self, prompt):
+        return BiStream(self._streamed(prompt))
 
 
 def run_pdb_test(path: str):
     repo_root = path
     files = toolbox.code_ls(path)
     src_files = [f for f in files if f.endswith(".py")]
-    reports = []
+    reports: list[str] = []
 
     system = util.slurp("resources/pdb_prompt.md")
     agent = PDBAgent(
@@ -160,14 +163,14 @@ def run_pdb_test(path: str):
             toolbox.spit,
             make_run_repo_tests_tool(repo_root),
         ],
-        name="pdb_agent_014",
+        name="pdb_agent_017",
     )
 
     def _per_file_stream(f: str):
         tool_calls: list[tuple[dict[str, Any], Any]] = []
         test_results: dict[str, Any] | None = None
         summaries: list[str] = []
-        file_report = None
+        file_report: str | None = None
 
         prompt = Template(util.slurp("resources/pdb_file_prompt.md")).safe_substitute(
             repo_path=path,
@@ -176,44 +179,40 @@ def run_pdb_test(path: str):
             tool_shape=agent.tool_shape(),
         )
 
-        base = agent.streamed(prompt)
+        # --- handlers (pure side-effects) ---
 
-        def handle_tool_call(parsed: dict[str, Any]):
+        def handle_tool_call(ev: dict[str, Any]) -> None:
             nonlocal test_results
+            res = agent.call_tool(ev)
 
-            res = agent.call_tool(parsed)
-
-            if parsed.get("tool") == "run_repo_tests":
+            if ev.get("tool") == "run_repo_tests":
                 test_results = res
             else:
-                tool_calls.append((parsed, res))
+                tool_calls.append((ev, res))
 
             agent.log(
                 {
                     "type": "trivialai.agent.log",
-                    "message": f"Running a tool call {parsed} -> {type(res)}",
+                    "message": f"Running a tool call {ev} -> {type(res)}",
                 }
             )
 
-        def handle_summary(ev):
-            summary_text = ev.get("summary") or ""
-            if summary_text:
-                agent.spit_summary(summary_text)
-            summaries.append(summary_text)
+        def handle_summary(ev: dict[str, Any]) -> None:
+            txt = ev.get("summary") or ""
+            if txt:
+                agent.spit_summary(txt)
+            summaries.append(txt)
 
-        def handle_report(ev):
+        def handle_conclusion(ev: dict[str, Any]) -> None:
             nonlocal file_report
-            file_report = ev.get("summary") or ev.get("report")
-            reports.append(file_report)
-            agent.spit_report(f, file_report)
+            rep = ev.get("summary") or ev.get("report") or ""
+            file_report = rep
+            reports.append(rep)
+            agent.spit_report(f, rep)
 
-        def _proceed(ev: dict[str, Any]):
-            tp = ev.get("type")
-            if tp == "summary":
-                handle_summary(ev)
-            if tp == "tool-call":
-                handle_tool_call(ev)
+        # --- prompt builder for follow-ups (uses accumulated state) ---
 
+        def build_followup_prompt() -> str:
             calls_txt = "\n\n".join(
                 f"You previously asked me to run the tool call {pc}. "
                 f"The result of that call was:\n```json\n{r}\n```"
@@ -228,43 +227,60 @@ def run_pdb_test(path: str):
 
             if summaries:
                 journal_txt = "\n\n---\n\n".join(
-                    f"Summary {i+1}:\n{txt}" for i, txt in enumerate(summaries)
+                    f"Summary {i+1}:\n{txt}" for i, txt in enumerate(summaries) if txt
                 )
                 summaries_section = (
-                    f"So far, you have recorded the following progress summaries "
-                    f"for {f}:\n\n{journal_txt}\n\n"
+                    f"So far, you have recorded the following progress summaries for {f}:\n\n"
+                    f"{journal_txt}\n\n"
                 )
             else:
                 summaries_section = (
                     f"You have not yet provided any progress summaries for {f}.\n\n"
                 )
 
-            pr = (
+            return (
                 f"{summaries_section}"
                 f"{tests_txt}\n\n"
                 f"{calls_txt}\n\n"
                 f"{prompt}\n"
             )
 
-            yield from agent.streamed(pr)
+        # --- one iteration step: ignore driver; state comes from taps ---
 
-        yield from repeat_until(
-            base,
-            _proceed,
-            stop=isType("conclusion"),
-            max_iters=15,
-        ).tap(handle_report, focus=isType("conclusion"))
+        def _proceed(_driver_ignored: Any):
+            yield from agent.streamed(build_followup_prompt())
 
-        yield from agent.streamed(
-            Template(util.slurp("resources/pdb_shrinker_prompt.md")).safe_substitute(
+        base = agent.streamed(prompt)
+
+        # Stream everything, but side-effect state via taps.
+        yield from (
+            repeat_until(
+                base,
+                _proceed,
+                stop=isType("conclusion"),
+                max_iters=15,
+            )
+            .tap(handle_tool_call, focus=isType("tool-call"))
+            .tap(handle_summary, focus=isType("summary"))
+            .tap(handle_conclusion, focus=isType("conclusion"))
+        )
+
+        # Optional: shrink report after conclusion (only if we got one).
+        if file_report:
+            shrink_prompt = Template(
+                util.slurp("resources/pdb_shrinker_prompt.md")
+            ).safe_substitute(
                 repo_path=path,
                 files=files,
                 file_path=f,
                 tool_shape=agent.tool_shape(),
                 file_report=file_report,
             )
-        )
 
-    # Top-level: flatten per-file streams
+            # If shrinker emits a conclusion, we treat it as the new report.
+            yield from agent.streamed(shrink_prompt).tap(
+                handle_conclusion, focus=isType("conclusion")
+            )
+
     for f in src_files[0:2]:
         yield from _per_file_stream(f)
