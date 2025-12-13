@@ -10,7 +10,7 @@ from typing import Any
 from trivialai import bedrock, ollama, util
 from trivialai.agent import toolbox, toolkit
 from trivialai.agent.core import Agent
-from trivialai.bistream import force, repeat_until
+from trivialai.bistream import force, isType, repeat_until
 from trivialai.log import getLogger
 
 from . import prepare
@@ -131,7 +131,17 @@ class PDBAgent(Agent):
         util.spit(path, report)
 
     def streamed(self, prompt):
-        return self.stream_checked(self.check_resp, prompt)
+        for ev in self.stream_checked(self.check_resp, prompt):
+            if (
+                isinstance(ev, dict)
+                and ev.get("ok")
+                and isinstance(ev.get("parsed"), list)
+                and all(
+                    isinstance(el, dict) and el.get("type") is not None
+                    for el in ev["parsed"]
+                )
+            ):
+                yield from ev["parsed"]
 
 
 def run_pdb_test(path: str):
@@ -150,7 +160,7 @@ def run_pdb_test(path: str):
             toolbox.spit,
             make_run_repo_tests_tool(repo_root),
         ],
-        name="pdb_agent_012",
+        name="pdb_agent_014",
     )
 
     def _per_file_stream(f: str):
@@ -197,19 +207,12 @@ def run_pdb_test(path: str):
             reports.append(file_report)
             agent.spit_report(f, file_report)
 
-        def _proceed(final_ev: dict[str, Any]):
-            nonlocal test_results
-
-            parsed = final_ev.get("parsed") or []
-            if not parsed:
-                return
-
-            for it in parsed:
-                tp = it.get("type")
-                if tp == "summary":
-                    handle_summary(it)
-                if tp == "tool-call":
-                    handle_tool_call(it)
+        def _proceed(ev: dict[str, Any]):
+            tp = ev.get("type")
+            if tp == "summary":
+                handle_summary(ev)
+            if tp == "tool-call":
+                handle_tool_call(ev)
 
             calls_txt = "\n\n".join(
                 f"You previously asked me to run the tool call {pc}. "
@@ -248,19 +251,9 @@ def run_pdb_test(path: str):
         yield from repeat_until(
             base,
             _proceed,
-            pred=isType("final"),
-            stop=lambda final_ev, i: any(
-                (it.get("type") == "conclusion") for it in final_ev.get("parsed") or []
-            ),
+            stop=isType("conclusion"),
             max_iters=15,
-        ).tap(
-            lambda ev: handle_report(
-                [e for e in ev.get("parsed", {}) if e.get("type") == "conclusion"][0]
-            ),
-            focus=lambda ev: any(
-                (it.get("type") == "conclusion") for it in ev.get("parsed") or []
-            ),
-        )
+        ).tap(handle_report, focus=isType("conclusion"))
 
         yield from agent.streamed(
             Template(util.slurp("resources/pdb_shrinker_prompt.md")).safe_substitute(
@@ -275,7 +268,3 @@ def run_pdb_test(path: str):
     # Top-level: flatten per-file streams
     for f in src_files[0:2]:
         yield from _per_file_stream(f)
-
-
-def isType(type_name):
-    return lambda ev: isinstance(ev, dict) and ev.get("type") == type_name
