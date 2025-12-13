@@ -1,4 +1,5 @@
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -7,7 +8,7 @@ def prepare_repo(agent, repo_root):
     Prepare the target repository for property-based testing.
 
     Steps:
-    1. Create a virtualenv named 'venv-robot_army' in the repo root if it
+    1. Create a virtualenv named 'env-robot_army' in the repo root if it
        does not already exist.
     2. Use that virtualenv's Python to:
        - pip install -r requirements.txt (if it exists)
@@ -15,7 +16,7 @@ def prepare_repo(agent, repo_root):
        - pip install hypothesis
     """
     root = Path(repo_root).expanduser().resolve()
-    venv_dir = root / "venv-robot_army"
+    venv_dir = root / "env-robot_army"
 
     agent.log(
         {

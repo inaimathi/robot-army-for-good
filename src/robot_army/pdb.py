@@ -2,6 +2,7 @@
 import json
 import os.path
 import subprocess
+import time
 from os import environ as ENV
 from pathlib import Path
 from string import Template
@@ -44,7 +45,7 @@ def make_run_repo_tests_tool(repo_root: str):
           - stdout: captured test runner stdout (may be truncated)
           - stderr: captured test runner stderr (may be truncated)
         """
-        python = os.path.join(repo_root, "venv-robot_army", "bin", "python")
+        python = os.path.join(repo_root, "env-robot_army", "bin", "python")
         try:
             proc = subprocess.run(
                 [python, "-m", "unittest", "discover", "-s", "tests"],
@@ -116,18 +117,14 @@ class PDBAgent(Agent):
         util.spit(self.filepath("summaries.md"), text, mode="a")
         util.spit(self.filepath("summaries.md"), delimiter, mode="a")
 
-    def spit_report(self, origin_path: str, report: str) -> None:
+    def spit_report(self, origin_path: str, report: str, shrunk: bool = False) -> None:
         rel = str(Path(origin_path).relative_to(Path(self.repo_root)))
-        path = self.filepath(f"report_{rel.replace('/', '_')}.md")
+        path = self.filepath(
+            f"report_{rel.replace('/', '_')}{'_shrunk' if shrunk else''}.md"
+        )
         util.spit(path, report)
 
     def _streamed(self, prompt: str):
-        """
-        "Full streamy" surface: yield ONLY parsed items (summary/conclusion/tool-call).
-
-        All other low-level events (start/end/delta/final envelope) are intentionally
-        not bubbled up here.
-        """
         for ev in self.stream_checked(self.check_resp, prompt):
             if (
                 isinstance(ev, dict)
@@ -163,14 +160,18 @@ def run_pdb_test(path: str):
             toolbox.spit,
             make_run_repo_tests_tool(repo_root),
         ],
-        name="pdb_agent_017",
+        name="pdb_agent_019",
     )
 
     def _per_file_stream(f: str):
+        started = time.time()
         tool_calls: list[tuple[dict[str, Any], Any]] = []
         test_results: dict[str, Any] | None = None
         summaries: list[str] = []
         file_report: str | None = None
+        shrunk_report: str | None = None
+        error: dict[str, str] | None = None
+        exc: BaseException | None = None
 
         prompt = Template(util.slurp("resources/pdb_file_prompt.md")).safe_substitute(
             repo_path=path,
@@ -210,17 +211,23 @@ def run_pdb_test(path: str):
             reports.append(rep)
             agent.spit_report(f, rep)
 
+        def handle_shrunk(ev: dict[str, Any]) -> None:
+            nonlocal shrunk_report
+            rep = ev.get("summary") or ev.get("report") or ""
+            shrunk_report = rep
+            agent.spit_report(f, rep, shrunk=True)
+
         # --- prompt builder for follow-ups (uses accumulated state) ---
 
         def build_followup_prompt() -> str:
             calls_txt = "\n\n".join(
                 f"You previously asked me to run the tool call {pc}. "
-                f"The result of that call was:\n```json\n{r}\n```"
+                f"The result of that call was:\n```\n{r}\n```"
                 for pc, r in tool_calls
             )
 
             tests_txt = (
-                "The most recent test run result is:\n" f"```json\n{test_results}\n```"
+                "The most recent test run result is:\n" f"```\n{test_results}\n```"
                 if test_results is not None
                 else "You have not run the repository tests yet for this file."
             )
@@ -245,42 +252,57 @@ def run_pdb_test(path: str):
                 f"{prompt}\n"
             )
 
-        # --- one iteration step: ignore driver; state comes from taps ---
-
-        def _proceed(_driver_ignored: Any):
-            yield from agent.streamed(build_followup_prompt())
-
         base = agent.streamed(prompt)
 
-        # Stream everything, but side-effect state via taps.
-        yield from (
-            repeat_until(
-                base,
-                _proceed,
-                stop=isType("conclusion"),
-                max_iters=15,
-            )
-            .tap(handle_tool_call, focus=isType("tool-call"))
-            .tap(handle_summary, focus=isType("summary"))
-            .tap(handle_conclusion, focus=isType("conclusion"))
-        )
-
-        # Optional: shrink report after conclusion (only if we got one).
-        if file_report:
-            shrink_prompt = Template(
-                util.slurp("resources/pdb_shrinker_prompt.md")
-            ).safe_substitute(
-                repo_path=path,
-                files=files,
-                file_path=f,
-                tool_shape=agent.tool_shape(),
-                file_report=file_report,
+        try:
+            # Stream everything, but side-effect state via taps.
+            yield from (
+                repeat_until(
+                    base,
+                    lambda _: agent.streamed(build_followup_prompt()),
+                    stop=isType("conclusion"),
+                    max_iters=15,
+                )
+                .tap(handle_tool_call, focus=isType("tool-call"))
+                .tap(handle_summary, focus=isType("summary"))
+                .tap(handle_conclusion, focus=isType("conclusion"))
             )
 
-            # If shrinker emits a conclusion, we treat it as the new report.
-            yield from agent.streamed(shrink_prompt).tap(
-                handle_conclusion, focus=isType("conclusion")
-            )
+            # Optional: shrink report after conclusion (only if we got one).
+            if file_report:
+                shrink_prompt = Template(
+                    util.slurp("resources/pdb_shrinker_prompt.md")
+                ).safe_substitute(
+                    repo_path=path,
+                    files=files,
+                    file_path=f,
+                    tool_shape=agent.tool_shape(),
+                    file_report=file_report,
+                )
 
-    for f in src_files[0:2]:
+                # If shrinker emits a conclusion, we treat it as the new report.
+                yield from agent.streamed(shrink_prompt).tap(
+                    handle_shrunk, focus=isType("conclusion")
+                )
+
+        except Exception as e:
+            exc = e
+            error = {"type": type(e).__name__, "message": str(e)}
+
+        elapsed_s = round(time.time() - started, 3)
+        yield {
+            "type": "checkpoint",
+            "stage": "file",
+            "file_path": f,
+            "file_report": file_report,
+            "shrunk_report": shrunk_report,
+            "tests": test_results,
+            "error": error,
+            "elapsed_s": elapsed_s,
+        }
+
+        if exc is not None:
+            raise exc
+
+    for f in src_files[0:10]:
         yield from _per_file_stream(f)
