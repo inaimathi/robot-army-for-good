@@ -2,10 +2,12 @@
 import json
 import os.path
 import subprocess
+import sys
 import time
 from os import environ as ENV
 from pathlib import Path
 from string import Template
+from types import TracebackType
 from typing import Any
 
 from trivialai import bedrock, util
@@ -28,6 +30,14 @@ LLM = bedrock.Bedrock(
 def main():
     gen = run_pdb_test(str(Path("~/projects/pycronado/").expanduser().resolve()))
     return force(gen)
+
+
+def _to_str(x):
+    if x is None:
+        return ""
+    if isinstance(x, (bytes, bytearray)):
+        return x.decode("utf-8", errors="replace")
+    return x
 
 
 def make_run_repo_tests_tool(repo_root: str):
@@ -58,8 +68,8 @@ def make_run_repo_tests_tool(repo_root: str):
             return {
                 "status": "timeout",
                 "exit_code": None,
-                "stdout": e.stdout or "",
-                "stderr": (e.stderr or "") + "\n[timeout]",
+                "stdout": _to_str(e.stdout),
+                "stderr": _to_str(e.stderr) + "\n[timeout]",
             }
 
         def _trim(s: str, limit: int = 8000) -> str:
@@ -160,7 +170,7 @@ def run_pdb_test(path: str):
             toolbox.spit,
             make_run_repo_tests_tool(repo_root),
         ],
-        name="pdb_agent_019",
+        name="pdb_agent_020",
     )
 
     def _per_file_stream(f: str):
@@ -171,7 +181,10 @@ def run_pdb_test(path: str):
         file_report: str | None = None
         shrunk_report: str | None = None
         error: dict[str, str] | None = None
-        exc: BaseException | None = None
+
+        exc_info: (
+            tuple[type[BaseException], BaseException, TracebackType | None] | None
+        ) = None
 
         prompt = Template(util.slurp("resources/pdb_file_prompt.md")).safe_substitute(
             repo_path=path,
@@ -286,7 +299,9 @@ def run_pdb_test(path: str):
                 )
 
         except Exception as e:
-            exc = e
+            # Preserve full traceback for the eventual re-raise after emitting checkpoint.
+            _t, _e, _tb = sys.exc_info()
+            exc_info = (_t, _e, _tb)
             error = {"type": type(e).__name__, "message": str(e)}
 
         elapsed_s = round(time.time() - started, 3)
@@ -301,8 +316,9 @@ def run_pdb_test(path: str):
             "elapsed_s": elapsed_s,
         }
 
-        if exc is not None:
-            raise exc
+        if exc_info is not None:
+            _t, _e, _tb = exc_info
+            raise _e.with_traceback(_tb)
 
     for f in src_files[0:10]:
         yield from _per_file_stream(f)
