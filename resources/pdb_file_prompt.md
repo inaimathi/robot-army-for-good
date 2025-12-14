@@ -47,8 +47,10 @@ Your responses MUST always be one of the following JSON objects:
         {"type": "conclusion", "summary": MarkdownString}
 
      The MarkdownString should be a concise but complete summary of your findings for this
-     file: what you tested, what passed/failed, which bugs you believe are real, and any
-     suggested fixes.
+     file: what you tested, what passed/failed, which bugs you believe are real, repro steps 
+	 in the form of tests and/or REPLable code snippets for any such bugs, and any
+     suggested fixes. IMPORTANT: you MUST include repro steps, if you don't your work for that
+	 particular bug will be useless.
 
 You SHOULD NOT emit a `"conclusion"` until you have:
 
