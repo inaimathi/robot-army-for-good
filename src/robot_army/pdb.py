@@ -1,4 +1,5 @@
 # pdb.py
+import json
 import sys
 import time
 from os import environ as ENV
@@ -16,14 +17,16 @@ from . import pdbagent, prepare
 
 logger = getLogger("robot_army.pdb")
 
-LLM = bedrock.Bedrock(
-    model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-    region="us-east-1",
-    aws_access_key_id=ENV["AWS_ACCESS_KEY"],
-    aws_secret_access_key=ENV["AWS_ACCESS_SECRET"],
-    max_tokens=8192,
-)
-# LLM = ollama.Ollama("qwq-uncapped:latest", "http://localhost:11435/")
+AGENT_NAME = "pdb_agent_024"
+
+# LLM = bedrock.Bedrock(
+#     model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+#     region="us-east-1",
+#     aws_access_key_id=ENV["AWS_ACCESS_KEY"],
+#     aws_secret_access_key=ENV["AWS_ACCESS_SECRET"],
+#     max_tokens=8192,
+# )
+LLM = ollama.Ollama("qwq-uncapped:latest", "http://localhost:11435/")
 # LLM = ollama.Ollama("deepseek-coder-v2:latest", "http://localhost:11435/")
 
 CHECKPOINT = "pdb.checkpoint"
@@ -31,17 +34,37 @@ CHECKPOINT = "pdb.checkpoint"
 
 def main():
     checkpoints = []
-    gen = BiStream(
-        run_pdb_test(str(Path("~/projects/pycronado/").expanduser().resolve()))
-    ).tap(lambda ev: checkpoints.append(ev), focus=isType(CHECKPOINT)).then(
-        LLM.stream(, json.dumps(checkpoints))
+
+    def _then(*args, **kwargs):
+        print("**************************************************")
+        print("RUNNING THEN")
+        print("**************************************************")
+        return LLM.stream_checked(
+            util.json_shape({"type": "conclusion", "summary": str}),
+            util.slurp("resources/pdb_reporter_prompt.md"),
+            json.dumps(checkpoints),
+        ).tap(
+            lambda ev: util.spit("repo-report.md", ev["parsed"]["summary"]),
+            focus=util.json_shaped({"type": "final", "ok": True, "parsed": dict}),
+        )
+
+    gen = (
+        BiStream(
+            run_pdb_test(str(Path("~/projects/pycronado/").expanduser().resolve()))
+        )
+        .tap(lambda ev: checkpoints.append(ev), focus=isType(CHECKPOINT))
+        .then(
+            lambda _: LLM.stream_checked(
+                util.json_shape({"type": "conclusion", "summary": str}),
+                util.slurp("resources/pdb_reporter_prompt.md"),
+                json.dumps(checkpoints),
+            ).tap(
+                lambda ev: util.spit("repo-report.md", ev["parsed"]["summary"]),
+                focus=util.json_shaped({"type": "final", "ok": True, "parsed": dict}),
+            )
+        )
     )
-    force(gen)
-    print("**************************************************")
-    print("SEQUENCE COMPLETE")
-    print("**************************************************")
-    return LLM.stream
-    return checkpoints
+    return force(gen)
 
 
 def run_pdb_test(path: str):
@@ -55,7 +78,7 @@ def run_pdb_test(path: str):
         LLM,
         repo_root,
         system=system,
-        name="pdb_agent_023",
+        name=AGENT_NAME,
     )
 
     def _per_file_stream(f: str):
@@ -193,7 +216,7 @@ def run_pdb_test(path: str):
         yield {
             "type": CHECKPOINT,
             "stage": "file",
-            "file_path": Path(f).relative_to(Path(repo_root)),
+            "file_path": str(Path(f).relative_to(Path(repo_root))),
             "file_report": file_report,
             "shrunk_report": shrunk_report,
             "tests": test_results,
