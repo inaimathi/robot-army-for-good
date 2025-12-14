@@ -10,8 +10,6 @@ from typing import Any, Callable
 
 from trivialai import util
 
-# ----------------------------- small helpers -----------------------------
-
 
 def _to_str(x: Any) -> str:
     if x is None:
@@ -27,9 +25,22 @@ def _trim(s: str, limit: int = 8000) -> str:
     return s[:limit] + "\n...[truncated]..."
 
 
-def _is_within_repo(repo_root: Path, p: Path) -> bool:
+def _is_within_repo_lexical(repo_root: Path, p: Path) -> bool:
+    """
+    Return True if p is *lexically* inside repo_root (no symlink resolution).
+
+    This is important for venv binaries: env/bin/python is often a symlink to a
+    system python outside the repo. We want to allow invoking it, as long as the
+    *path we are executing* is inside the repo tree.
+    """
     try:
-        p.resolve().relative_to(repo_root.resolve())
+        root = repo_root.expanduser().resolve()
+        pp = p.expanduser()
+        if not pp.is_absolute():
+            pp = root / pp
+        # absolute() does NOT resolve symlinks
+        pp_abs = pp.absolute()
+        pp_abs.relative_to(root)
         return True
     except Exception:
         return False
@@ -59,19 +70,26 @@ def _cmd_allowed(kind: str, repo_root: Path, cmd: list[str]) -> bool:
     """
     exe = cmd[0]
 
-    # Allow absolute executables only if they live inside the repo root
-    # (e.g. env-robot_army/bin/python).
-    if os.path.isabs(exe) and not _is_within_repo(repo_root, Path(exe)):
+    # Allow absolute executables only if the *path string* is within the repo.
+    # Do NOT resolve symlinks here: venv/bin/python is commonly a symlink to a
+    # system python outside the repo, and that's fine for test running.
+    if os.path.isabs(exe) and not _is_within_repo_lexical(repo_root, Path(exe)):
         return False
 
     if kind == "python":
         # expected: <repo>/env-robot_army/bin/python -m unittest discover -s tests
         if (
-            exe.endswith("/env-robot_army/bin/python")
-            or exe == "python"
+            exe == "python"
             or exe.endswith("/python")
+            or exe.endswith("/env-robot_army/bin/python")
+            or ("/env-robot_army/bin/python" in exe)
         ):
-            return ("-m" in cmd and "unittest" in cmd) or ("pytest" in cmd)
+            # allow unittest (recommended default)
+            if "-m" in cmd and "unittest" in cmd:
+                return True
+            # allow pytest if repo uses it
+            if any(part == "pytest" or part.endswith("/pytest") for part in cmd):
+                return True
         return False
 
     if kind == "node":
@@ -105,12 +123,8 @@ def _cmd_allowed(kind: str, repo_root: Path, cmd: list[str]) -> bool:
 
 def _should_try_next(cmd: list[str], returncode: int, stdout: str, stderr: str) -> bool:
     """
-    IMPORTANT: Only fall back to the next candidate command when the failure looks like
-    'this runner/target doesn't exist', NOT when the tests actually failed.
-
-    This fixes the jq case:
-      - make check runs and fails (tests failing) => should RETURN that output
-      - not proceed to make test (which doesn't exist) and mask the real output
+    Only fall back to the next candidate command when the failure looks like
+    "this runner/target doesn't exist", NOT when the tests actually failed.
     """
     combined = (stderr or "") + "\n" + (stdout or "")
 
@@ -153,7 +167,6 @@ def make_run_repo_tests_tool(repo_root: str) -> Callable[[], dict[str, Any]]:
           - cwd: working directory used
           - error/message: if configuration is missing/invalid
         """
-        # Prefer the prepared plan.
         plan: dict[str, Any] | None = None
         if plan_path.exists():
             try:
@@ -248,7 +261,7 @@ def make_run_repo_tests_tool(repo_root: str) -> Callable[[], dict[str, Any]]:
                     "stderr": _trim(_to_str(e.stderr) + "\n[timeout]", trim_limit),
                 }
             except FileNotFoundError as e:
-                # Runner missing (e.g. make/npm not installed). This is safe to fall back from.
+                # Runner missing (e.g. make/npm not installed). Safe to fall back from.
                 res = {
                     "status": "fail",
                     "exit_code": None,
@@ -276,7 +289,6 @@ def make_run_repo_tests_tool(repo_root: str) -> Callable[[], dict[str, Any]]:
             if proc.returncode == 0:
                 return res
 
-            # ✅ Only try the next fallback if this looks like "runner/target missing"
             if not _should_try_next(cmd, proc.returncode, res["stdout"], res["stderr"]):
                 return res
 
@@ -312,6 +324,8 @@ def make_tools(repo_root: Path) -> list[Callable[..., Any]]:
     def _resolve_repo_path(file_path: str) -> Path:
         raw = Path(str(file_path)).expanduser()
         candidate = raw if raw.is_absolute() else (root / raw)
+
+        # IMPORTANT: for file reads/writes we *do* resolve to prevent symlink escapes.
         resolved = candidate.resolve()
         try:
             resolved.relative_to(root)
@@ -320,9 +334,6 @@ def make_tools(repo_root: Path) -> list[Callable[..., Any]]:
         return resolved
 
     def slurp(file_path: str) -> Any:
-        """
-        Read a UTF-8 text file from within the repository.
-        """
         try:
             p = _resolve_repo_path(file_path)
             return util.slurp(str(p))
@@ -335,10 +346,6 @@ def make_tools(repo_root: Path) -> list[Callable[..., Any]]:
             }
 
     def spit(file_path: str, text: str, mode: str = "w") -> dict[str, Any]:
-        """
-        Write UTF-8 text to a file within the repository.
-        mode defaults to "w" (overwrite). Use "a" to append.
-        """
         try:
             p = _resolve_repo_path(file_path)
             p.parent.mkdir(parents=True, exist_ok=True)

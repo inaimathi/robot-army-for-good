@@ -32,26 +32,10 @@ LLM = ollama.Ollama("qwq-uncapped:latest", "http://localhost:11435/")
 CHECKPOINT = "pdb.checkpoint"
 
 
-def main():
+def main(repo_path):
     checkpoints = []
-
-    def _then(*args, **kwargs):
-        print("**************************************************")
-        print("RUNNING THEN")
-        print("**************************************************")
-        return LLM.stream_checked(
-            util.json_shape({"type": "conclusion", "summary": str}),
-            util.slurp("resources/pdb_reporter_prompt.md"),
-            json.dumps(checkpoints),
-        ).tap(
-            lambda ev: util.spit("repo-report.md", ev["parsed"]["summary"]),
-            focus=util.json_shaped({"type": "final", "ok": True, "parsed": dict}),
-        )
-
     gen = (
-        BiStream(
-            run_pdb_test(str(Path("~/projects/pycronado/").expanduser().resolve()))
-        )
+        BiStream(run_pdb_test(str(Path(repo_path).expanduser().resolve())))
         .tap(lambda ev: checkpoints.append(ev), focus=isType(CHECKPOINT))
         .then(
             lambda _: LLM.stream_checked(
