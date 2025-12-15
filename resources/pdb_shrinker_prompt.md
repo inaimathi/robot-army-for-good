@@ -27,12 +27,14 @@ Using ONLY the information in the prior report (and any tool outputs, tests, or 
    - **HIGH** if it plausibly enables a security issue (auth bypass, data exposure, injection, privilege escalation, unsafe deserialization, etc.) OR a practical DoS/resource exhaustion/perf degradation path an attacker could trigger.
    - **LOW** otherwise.
 
-   If you are not confident it is exploitable, say so and keep it LOW or UNCLEAR-with-LOW by default. Be conservative.
+   If you are not confident it is exploitable, say so and keep it LOW (or UNCLEAR-with-LOW). Be conservative.
 
 3. **Minimal repro steps**  
-   Provide the **smallest repro** you can:
-   - Prefer a **single focused test case** (e.g., `pytest` / `unittest` / Hypothesis if appropriate), or
-   - A **small REPL-able snippet** that a maintainer can paste and run.
+   Provide the **smallest repro** you can, aligned to the repo’s language/tooling as evidenced in the prior report:
+
+   - **Python**: a single focused `unittest`/`pytest` test, or a tiny REPL-able snippet. Hypothesis is OK only if the failure is deterministic or a fixed seed/repro is included.
+   - **JavaScript/TypeScript**: a single focused test (Jest/Vitest/Tape/Node test runner as applicable) or a minimal `node` script snippet.
+   - **C/C++**: a tiny standalone C program (or minimal unit test if the repo already uses one), plus how to build/run it (e.g., `make check`, `make`, or a `cc ...` line).
 
    The repro must target the implementation behavior (not “the agent thinks…”). If the repro depends on environment, state the dependency.
 
@@ -52,6 +54,7 @@ Using ONLY the information in the prior report (and any tool outputs, tests, or 
 - **Do not add new issues** that were not in the prior report.
 - If the prior report contains multiple suspected issues that are actually the same root cause, merge them and say so.
 - If the prior report lacks enough evidence, explicitly say what is missing (e.g., “need exact stack trace”, “need failing test output”, “need contract/spec reference”).
+- If the prior report shows a flaky/non-deterministic failure, your repro must include how to make it deterministic (seed/reproducer) or you must mark it UNCLEAR and say what would be needed to stabilize it.
 
 ## Required output format
 
@@ -77,3 +80,7 @@ The `summary` MarkdownString must use this structure:
   * One compact report per REAL issue (and optionally for UNCLEAR if it’s important)
 
 Keep it tight. Prefer clarity and reproducibility over volume.
+
+```
+
+If you paste the other prompts (file prompt, main loop prompt, tool-shape prompt, etc.), I’ll rewrite them in the same style and also update any examples (`pytest`, etc.) so they don’t accidentally bias the agent toward Python when it’s in a JS/C repo.
