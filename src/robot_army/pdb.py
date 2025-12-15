@@ -10,45 +10,30 @@ from typing import Any
 
 from trivialai import bedrock, ollama, util
 from trivialai.agent import toolbox
-from trivialai.bistream import BiStream, force, isType, repeat_until
+from trivialai.bistream import BiStream, force, is_type, repeat_until
 from trivialai.log import getLogger
 
 from . import pdbagent, prepare
 
 logger = getLogger("robot_army.pdb")
 
-AGENT_NAME = "pdb_agent_024"
+AGENT_NAME = "pdb_agent_026"
 
-# LLM = bedrock.Bedrock(
-#     model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-#     region="us-east-1",
-#     aws_access_key_id=ENV["AWS_ACCESS_KEY"],
-#     aws_secret_access_key=ENV["AWS_ACCESS_SECRET"],
-#     max_tokens=8192,
-# )
-LLM = ollama.Ollama("qwq-uncapped:latest", "http://localhost:11435/")
+LLM = bedrock.Bedrock(
+    model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+    region="us-east-1",
+    aws_access_key_id=ENV["AWS_ACCESS_KEY"],
+    aws_secret_access_key=ENV["AWS_ACCESS_SECRET"],
+    max_tokens=8192,
+)
+# LLM = ollama.Ollama("qwq-uncapped:latest", "http://localhost:11435/")
 # LLM = ollama.Ollama("deepseek-coder-v2:latest", "http://localhost:11435/")
 
 CHECKPOINT = "pdb.checkpoint"
 
 
 def main(repo_path):
-    checkpoints = []
-    gen = (
-        BiStream(run_pdb_test(str(Path(repo_path).expanduser().resolve())))
-        .tap(lambda ev: checkpoints.append(ev), focus=isType(CHECKPOINT))
-        .then(
-            lambda _: LLM.stream_checked(
-                util.json_shape({"type": "conclusion", "summary": str}),
-                util.slurp("resources/pdb_reporter_prompt.md"),
-                json.dumps(checkpoints),
-            ).tap(
-                lambda ev: util.spit("repo-report.md", ev["parsed"]["summary"]),
-                focus=util.json_shaped({"type": "final", "ok": True, "parsed": dict}),
-            )
-        )
-    )
-    return force(gen)
+    return force(run_pdb_test(str(Path(repo_path).expanduser().resolve())))
 
 
 def run_pdb_test(path: str):
@@ -165,12 +150,12 @@ def run_pdb_test(path: str):
                 repeat_until(
                     base,
                     lambda _: agent.streamed(build_followup_prompt()),
-                    stop=isType("conclusion"),
+                    stop=is_type("conclusion"),
                     max_iters=15,
                 )
-                .tap(handle_tool_call, focus=isType("tool-call"))
-                .tap(handle_summary, focus=isType("summary"))
-                .tap(handle_conclusion, focus=isType("conclusion"))
+                .tap(handle_tool_call, focus=is_type("tool-call"))
+                .tap(handle_summary, focus=is_type("summary"))
+                .tap(handle_conclusion, focus=is_type("conclusion"))
             )
 
             # Optional: shrink report after conclusion (only if we got one).
@@ -187,7 +172,7 @@ def run_pdb_test(path: str):
 
                 # If shrinker emits a conclusion, we treat it as the new report.
                 yield from agent.streamed(shrink_prompt).tap(
-                    handle_shrunk, focus=isType("conclusion")
+                    handle_shrunk, focus=is_type("conclusion")
                 )
 
         except Exception as e:
@@ -212,5 +197,23 @@ def run_pdb_test(path: str):
             _t, _e, _tb = exc_info
             raise _e.with_traceback(_tb)
 
-    for f in src_files[0:1]:
-        yield from _per_file_stream(f)
+    checkpoints: list[dict[str, Any]] = []
+
+    per_file = BiStream.ensure(src_files).mapcat(_per_file_stream)
+
+    full = per_file.tap(
+        lambda ev: checkpoints.append(ev), focus=is_type(CHECKPOINT)
+    ).then(
+        lambda: LLM.stream_checked(
+            util.json_shape({"type": "conclusion", "summary": str}),
+            util.slurp("resources/pdb_reporter_prompt.md"),
+            json.dumps(checkpoints),  # IMPORTANT: computed here, after per_file is done
+        ).tap(
+            lambda ev: util.spit(
+                agent.filepath("repo-report.md"), ev["parsed"]["summary"]
+            ),
+            focus=util.is_json_shaped({"type": "final", "ok": True, "parsed": dict}),
+        )
+    )
+
+    return full
