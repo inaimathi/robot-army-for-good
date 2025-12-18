@@ -58,9 +58,25 @@ Right now this repo mainly contains scaffolding and design notes. Expect rapid, 
 Until there’s a real release, the rough plan is:
 
 ```bash
-git clone https://github.com/<your-username>/robot-army-for-good.git
-cd robot-army-for-good
+$ git clone https://github.com/<your-username>/robot-army-for-good.git
+$ cd robot-army-for-good
+$ python3 -m venv env-robots ; source env-robots/bin/activate
+env-robots $ python
 
-# TODO: this doesn't seem to work currently - gets stuck
-python3 robot-army-for-good/rafg.py test jqlang/jq src/compile.c:gen_and
+>>> from src.robot_army import pdb
+>>> pdb.main("~/path/to/target/repo")
+2025-12-18 15:19:41,919 - robot_army.pbt - INFO - Running on ~/path/to/target/repo...
+2025-12-18 15:19:41,920 - robot_army.prepare - INFO - Preparing repository at /abs/path/to/target/repo
+2025-12-18 15:19:41,922 - robot_army.prepare - INFO - Wrote plan: /abs/path/to/target/repo/.robot_army/plan.json (kind=node, plan_hash=2b5d349a0c76cf62)
+2025-12-18 15:19:41,922 - robot_army.prepare - INFO - Prepare skip (already ok): os_deps.check
+2025-12-18 15:19:41,922 - robot_army.prepare - INFO - Prepare skip (already ok): prepare.0
+2025-12-18 15:19:41,923 - robot_army.prepare - INFO - Repository preparation complete.
+2025-12-18 15:19:41,923 - robot_army.pbt - INFO -    Repo prepared ~/path/to/target/repo...
+2025-12-18 15:19:41,929 - robot_army.pbt - INFO - Running test. Full source is 141 files...
+2025-12-18 15:19:52,125 - robot_army.pbt - INFO - Identified 13 candidate files...
+{'type': 'start', 'provider': 'bedrock', 'model': 'us.anthropic.claude-3-5-sonnet-20241022-v2:0'}
+Saying: {"type": "tool-call", "tool": "slurp", "args": {"file_path": "/abs/path/to/target/repo/file.js"}}
+...
 ```
+
+This'll run for a while. At the end, there should be an `./agent-repo` folder containing a `repo-report.md` along with a number of individual file reports. There may or may not also be source code changes and new files in the `target/repo`.
