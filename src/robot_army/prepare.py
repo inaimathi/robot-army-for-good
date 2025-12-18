@@ -1,6 +1,8 @@
 # prepare.py
 from __future__ import annotations
 
+import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -8,13 +10,11 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from trivialai.log import getLogger
 
 logger = getLogger("robot_army.prepare")
-# If your logging is showing duplicates, this usually stops “bubble up” duplication.
-# (If duplicates persist, you likely have multiple handlers attached upstream.)
 try:
     logger.propagate = False
 except Exception:
@@ -23,7 +23,10 @@ except Exception:
 
 PLAN_DIR = ".robot_army"
 PLAN_FILE = "plan.json"
+PROGRESS_FILE = "progress.ndjson"
 DEFAULT_TIMEOUT_SEC = 900
+
+T = TypeVar("T")
 
 
 # ----------------------------- helpers ---------------------------------
@@ -96,7 +99,6 @@ def _slurpish(p: Path) -> str:
 
 
 def _pick_libtoolize_bin() -> str | None:
-    # GNU libtoolize (Linux) vs glibtoolize (macOS/Homebrew)
     if _which("libtoolize"):
         return "libtoolize"
     if _which("glibtoolize"):
@@ -118,10 +120,6 @@ def _unique_paths(parts: list[str]) -> list[str]:
 
 
 def _guix_profile_aclocal_dirs() -> list[str]:
-    """
-    On Guix, aclocal macros often live under ~/.guix-profile/share/aclocal
-    and sometimes also ~/.guix-profile/share/aclocal-<ver>.
-    """
     home = Path.home()
     share = home / ".guix-profile" / "share"
     out: list[str] = []
@@ -137,18 +135,12 @@ def _guix_profile_aclocal_dirs() -> list[str]:
 def _autotools_env(
     base: dict[str, str] | None, *, add_aclocal_dirs: list[str]
 ) -> dict[str, str]:
-    """
-    Ensure ACLOCAL_PATH includes Guix-profile macro dirs (and anything else we pass).
-    This is the key fix for the persistent:
-      "Libtool library used but 'LIBTOOL' is undefined"
-    when using Guix-provided libtool/autotools.
-    """
     env = dict(base or {})
-    # Keep locale predictable (also silences perl locale spam).
     env.setdefault("CI", "1")
     env.setdefault("LANG", "C")
     env.setdefault("LC_ALL", "C")
 
+    # Respect base env first, then fall back to process env.
     existing = env.get("ACLOCAL_PATH") or os.environ.get("ACLOCAL_PATH", "")
     existing_parts = [p for p in existing.split(":") if p]
     new_parts = _unique_paths(add_aclocal_dirs + existing_parts)
@@ -157,44 +149,234 @@ def _autotools_env(
     return env
 
 
+# -------------------------- progress tracking ---------------------------
+
+
+def _plan_hash(plan: dict[str, Any]) -> str:
+    b = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(b).hexdigest()[:16]
+
+
+def _progress_path(root: Path) -> Path:
+    d = root / PLAN_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d / PROGRESS_FILE
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now(tz=_dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _append_progress(root: Path, ev: dict[str, Any]) -> None:
+    p = _progress_path(root)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(ev, sort_keys=True) + "\n")
+
+
+def _load_progress(root: Path) -> dict[str, dict[str, Any]]:
+    """
+    Returns latest record per event_id (last line wins).
+    """
+    p = _progress_path(root)
+    if not p.exists():
+        return {}
+
+    latest: dict[str, dict[str, Any]] = {}
+    try:
+        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.strip():
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            event_id = str(ev.get("event_id") or "")
+            if not event_id:
+                continue
+            latest[event_id] = ev
+    except Exception:
+        return latest
+    return latest
+
+
+def _event_id(plan_h: str, name: str, payload: dict[str, Any]) -> str:
+    # Deterministic + compact: event_id = <plan_hash>:<name>:<payload_hash>
+    b = json.dumps(
+        {"name": name, "payload": payload}, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    ph = hashlib.sha256(b).hexdigest()[:12]
+    return f"{plan_h}:{name}:{ph}"
+
+
+def _step_done(progress: dict[str, dict[str, Any]], event_id: str) -> bool:
+    return (progress.get(event_id) or {}).get("status") == "ok"
+
+
+def _run_recorded_step(
+    *,
+    root: Path,
+    progress: dict[str, dict[str, Any]],
+    plan_h: str,
+    name: str,
+    payload: dict[str, Any],
+    fn: Callable[[], T],
+    nonfatal: bool = False,
+) -> T | None:
+    """
+    Run a step once per (plan_hash, name, payload). If latest status is ok, skip.
+    Records begin/ok/fail to .robot_army/progress.ndjson.
+    """
+    eid = _event_id(plan_h, name, payload)
+
+    if _step_done(progress, eid):
+        logger.info("Prepare skip (already ok): %s", name)
+        return None
+
+    begin = {
+        "ts": _now_iso(),
+        "event_id": eid,
+        "name": name,
+        "status": "begin",
+        "payload": payload,
+    }
+    _append_progress(root, begin)
+    progress[eid] = begin
+
+    try:
+        res = fn()
+    except Exception as e:
+        if nonfatal:
+            logger.warning("Prepare nonfatal failure (marking ok): %s: %s", name, e)
+            ok = {
+                "ts": _now_iso(),
+                "event_id": eid,
+                "name": name,
+                "status": "ok",
+                "nonfatal": True,
+                "error": str(e),
+                "payload": payload,
+            }
+            _append_progress(root, ok)
+            progress[eid] = ok
+            return None
+
+        fail = {
+            "ts": _now_iso(),
+            "event_id": eid,
+            "name": name,
+            "status": "fail",
+            "error": str(e),
+            "payload": payload,
+        }
+        _append_progress(root, fail)
+        progress[eid] = fail
+        raise
+
+    ok = {
+        "ts": _now_iso(),
+        "event_id": eid,
+        "name": name,
+        "status": "ok",
+        "payload": payload,
+    }
+    _append_progress(root, ok)
+    progress[eid] = ok
+    return res
+
+
+def _run_recorded_cmd(
+    *,
+    root: Path,
+    progress: dict[str, dict[str, Any]],
+    plan_h: str,
+    name: str,
+    cmd: list[str],
+    cwd: Path,
+    env: dict[str, str] | None,
+    timeout_sec: int,
+    check: bool = True,
+    nonfatal: bool = False,
+) -> subprocess.CompletedProcess[str] | None:
+    payload = {
+        "cmd": cmd,
+        "cwd": str(cwd),
+        "env": env or {},
+        "timeout_sec": int(timeout_sec),
+        "check": bool(check),
+    }
+
+    def _go() -> subprocess.CompletedProcess[str]:
+        logger.info("Prepare cmd: %s", cmd)
+        return _run_cmd(cmd, cwd=cwd, env=env, timeout_sec=timeout_sec, check=check)
+
+    return _run_recorded_step(
+        root=root,
+        progress=progress,
+        plan_h=plan_h,
+        name=name,
+        payload=payload,
+        fn=_go,
+        nonfatal=nonfatal,
+    )
+
+
+# -------------------------- autotools ----------------------------------
+
+
 _LIBTOOL_UNDEFINED_RE = re.compile(
     r"Libtool library used but 'LIBTOOL' is undefined", re.I
 )
 
 
+def _autotools_fallback_sequence(
+    root: Path,
+    *,
+    progress: dict[str, dict[str, Any]],
+    plan_h: str,
+    env: dict[str, str],
+    timeout_sec: int,
+) -> None:
+    (root / "m4").mkdir(parents=True, exist_ok=True)
+
+    steps = [
+        ["aclocal", "-I", "m4"],
+        ["autoconf"],
+        ["automake", "--add-missing", "--copy"],
+        ["autoconf"],
+    ]
+    for i, cmd in enumerate(steps):
+        _run_recorded_cmd(
+            root=root,
+            progress=progress,
+            plan_h=plan_h,
+            name=f"autotools.fallback.{i}",
+            cmd=cmd,
+            cwd=root,
+            env=env,
+            timeout_sec=timeout_sec,
+            check=True,
+        )
+
+
 def _autotools_bootstrap(
     root: Path,
     *,
+    progress: dict[str, dict[str, Any]],
+    plan_h: str,
     needs_autoreconf: bool,
     needs_libtoolize: bool,
     timeout_sec: int,
     configure_flags: list[str],
     base_env: dict[str, str] | None,
 ) -> None:
-    """
-    Robust autotools bootstrap with an out-of-the-box fix for the libtool macro issue.
-
-    Strategy:
-      - if libtool is likely used:
-          * ensure m4/ exists
-          * run libtoolize --force --copy
-      - run autoreconf -fi (and *also* provide macro include dirs)
-          * env ACLOCAL_PATH includes ~/.guix-profile/share/aclocal (+ aclocal-*)
-          * pass -I m4 so aclocal searches the local macro dir too
-      - if it still fails with LIBTOOL undefined:
-          * fallback to an explicit sequence:
-                aclocal -I m4
-                autoconf
-                automake --add-missing --copy
-                autoconf
-    """
-    # 0) submodules (common for jq)
+    # 0) submodules
     if (root / ".git").exists() and _which("git"):
-        logger.info(
-            "Prepare cmd: %s", ["git", "submodule", "update", "--init", "--recursive"]
-        )
-        _run_cmd(
-            ["git", "submodule", "update", "--init", "--recursive"],
+        _run_recorded_cmd(
+            root=root,
+            progress=progress,
+            plan_h=plan_h,
+            name="git.submodule.update",
+            cmd=["git", "submodule", "update", "--init", "--recursive"],
             cwd=root,
             env=base_env,
             timeout_sec=timeout_sec,
@@ -204,48 +386,78 @@ def _autotools_bootstrap(
     # 1) libtoolize (if needed)
     m4_dir = root / "m4"
     if needs_libtoolize:
+        # harmless even if repeated / already present
         m4_dir.mkdir(parents=True, exist_ok=True)
+
         libtoolize_bin = _pick_libtoolize_bin()
         if not libtoolize_bin:
             raise RuntimeError(
                 "missing-os-deps: repo appears to use libtool but libtoolize/glibtoolize not found"
             )
 
-        logger.info("Prepare cmd: %s", [libtoolize_bin, "--force", "--copy"])
-        _run_cmd(
-            [libtoolize_bin, "--force", "--copy"],
+        env = _autotools_env(base_env, add_aclocal_dirs=_guix_profile_aclocal_dirs())
+        _run_recorded_cmd(
+            root=root,
+            progress=progress,
+            plan_h=plan_h,
+            name="autotools.libtoolize",
+            cmd=[libtoolize_bin, "--force", "--copy"],
             cwd=root,
-            env=_autotools_env(base_env, add_aclocal_dirs=_guix_profile_aclocal_dirs()),
+            env=env,
             timeout_sec=timeout_sec,
             check=True,
         )
 
     # 2) autoreconf (if needed)
     if needs_autoreconf:
-        # Crucial: make sure aclocal can see guix-profile macro dirs.
         env = _autotools_env(base_env, add_aclocal_dirs=_guix_profile_aclocal_dirs())
+
         cmd = ["autoreconf", "-fi"]
-        # Always include local macro dir if it exists / we created it.
         if m4_dir.is_dir():
             cmd += ["-I", "m4"]
 
-        logger.info("Prepare cmd: %s", cmd)
-        try:
-            _run_cmd(cmd, cwd=root, env=env, timeout_sec=timeout_sec, check=True)
-        except RuntimeError as e:
-            msg = str(e)
-            if _LIBTOOL_UNDEFINED_RE.search(msg):
-                logger.warning(
-                    "autoreconf hit LIBTOOL undefined; retrying with explicit aclocal/autoconf/automake sequence"
-                )
-                _autotools_fallback_sequence(root, env=env, timeout_sec=timeout_sec)
-            else:
-                raise
+        # We want this whole “autoreconf with fallback” to be a single skip-able step.
+        payload = {
+            "cmd": cmd,
+            "cwd": str(root),
+            "env": env,
+            "timeout_sec": int(timeout_sec),
+        }
+
+        def _autoreconf_with_fallback() -> None:
+            try:
+                _run_cmd(cmd, cwd=root, env=env, timeout_sec=timeout_sec, check=True)
+            except RuntimeError as e:
+                if _LIBTOOL_UNDEFINED_RE.search(str(e)):
+                    logger.warning(
+                        "autoreconf hit LIBTOOL undefined; retrying with explicit aclocal/autoconf/automake sequence"
+                    )
+                    _autotools_fallback_sequence(
+                        root,
+                        progress=progress,
+                        plan_h=plan_h,
+                        env=env,
+                        timeout_sec=timeout_sec,
+                    )
+                else:
+                    raise
+
+        _run_recorded_step(
+            root=root,
+            progress=progress,
+            plan_h=plan_h,
+            name="autotools.autoreconf_or_fallback",
+            payload=payload,
+            fn=_autoreconf_with_fallback,
+        )
 
     # 3) configure + build
-    logger.info("Prepare cmd: %s", ["./configure", *configure_flags])
-    _run_cmd(
-        ["./configure", *configure_flags],
+    _run_recorded_cmd(
+        root=root,
+        progress=progress,
+        plan_h=plan_h,
+        name="autotools.configure",
+        cmd=["./configure", *configure_flags],
         cwd=root,
         env=base_env,
         timeout_sec=timeout_sec,
@@ -253,9 +465,12 @@ def _autotools_bootstrap(
     )
 
     jobs = max(2, (os.cpu_count() or 4))
-    logger.info("Prepare cmd: %s", ["make", f"-j{jobs}"])
-    _run_cmd(
-        ["make", f"-j{jobs}"],
+    _run_recorded_cmd(
+        root=root,
+        progress=progress,
+        plan_h=plan_h,
+        name="autotools.make",
+        cmd=["make", f"-j{jobs}"],
         cwd=root,
         env=base_env,
         timeout_sec=timeout_sec,
@@ -263,27 +478,7 @@ def _autotools_bootstrap(
     )
 
 
-def _autotools_fallback_sequence(
-    root: Path, *, env: dict[str, str], timeout_sec: int
-) -> None:
-    """
-    Last-resort explicit sequence that bypasses some of autoreconf’s “best effort”.
-    """
-    # Ensure m4 exists if we’re going to include it.
-    (root / "m4").mkdir(parents=True, exist_ok=True)
-
-    steps = [
-        ["aclocal", "-I", "m4"],
-        ["autoconf"],
-        ["automake", "--add-missing", "--copy"],
-        ["autoconf"],
-    ]
-    for cmd in steps:
-        logger.info("Prepare cmd: %s", cmd)
-        _run_cmd(cmd, cwd=root, env=env, timeout_sec=timeout_sec, check=True)
-
-
-# --------------------------- plan detection --------------------------------
+# --------------------------- plan detection -----------------------------
 
 
 def _plan_node(root: Path) -> dict[str, Any]:
@@ -326,11 +521,24 @@ def _plan_node(root: Path) -> dict[str, Any]:
             "No test or test-node script found in package.json; test command list is empty."
         )
 
-    bins_required = ["node", "npm"] if pm == "npm" else ["node", pm]
+    # Corepack-aware required bin set:
+    bins_required: list[str] = ["node"]
     bins_optional: list[str] = []
-    if pm in ("pnpm", "yarn") and _which(pm) is None and _which("corepack") is not None:
-        prepare_cmds.insert(0, ["corepack", "enable"])
-        bins_optional.append(pm)
+
+    if pm == "npm":
+        bins_required.append("npm")
+    else:
+        if _which(pm) is not None:
+            bins_required.append(pm)
+        elif _which("corepack") is not None:
+            # We'll enable corepack as part of prepare steps; don't fail bins_required up front.
+            prepare_cmds.insert(0, ["corepack", "enable"])
+            bins_required.append("corepack")
+            bins_optional.append(pm)
+            notes.append(f"{pm} not found; using corepack enable before running {pm}.")
+        else:
+            # No corepack and pm missing => hard missing
+            bins_required.append(pm)
 
     return {
         "kind": "node",
@@ -382,7 +590,6 @@ def _plan_c_autotools(root: Path) -> dict[str, Any]:
     )
 
     ac_text = _slurpish(cfg_ac) + "\n" + _slurpish(cfg_in)
-    # Also scan Makefile.am patterns that strongly imply libtool usage.
     make_am = (
         _slurpish(root / "src" / "Makefile.am") + "\n" + _slurpish(root / "Makefile.am")
     )
@@ -393,7 +600,6 @@ def _plan_c_autotools(root: Path) -> dict[str, Any]:
     )
 
     configure_flags: list[str] = []
-    # jq-specific helpful flag (detected heuristically)
     if "oniguruma" in (_slurpish(cfg) + _slurpish(cfg_ac)):
         configure_flags.append("--with-oniguruma=builtin")
 
@@ -408,8 +614,6 @@ def _plan_c_autotools(root: Path) -> dict[str, Any]:
 
     bins_optional = ["pkg-config", "gcc", "cc", "clang", "m4"]
 
-    # We keep prepare/test lists in the plan (for visibility), but the *execution*
-    # of autotools prep is handled by _autotools_bootstrap for robustness.
     prepare_cmds: list[list[str]] = []
     if (root / ".git").exists():
         prepare_cmds.append(["git", "submodule", "update", "--init", "--recursive"])
@@ -469,33 +673,57 @@ def prepare_repo(repo_root: str) -> dict[str, Any]:
     """
     Prepare repo and write `.robot_army/plan.json`.
 
-    Key autotools robustness:
-      - Always inject ACLOCAL_PATH to include Guix profile macro dirs.
-      - Run libtoolize + autoreconf with -I m4 when libtool usage is detected.
-      - If LIBTOOL undefined still occurs, fall back to explicit aclocal/autoconf/automake sequence.
+    Idempotency:
+      - Progress is tracked in `.robot_army/progress.ndjson` (append-only).
+      - Each step has a deterministic event_id derived from:
+            plan_hash + (step_name, payload)
+      - A step is skipped if the *latest* record for that event_id has status == "ok".
+      - If a run is interrupted after "begin" but before "ok", the next run will re-attempt.
+
+    To force a full re-run:
+      - delete `.robot_army/progress.ndjson` (and optionally plan.json).
     """
     root = Path(repo_root).expanduser().resolve()
     logger.info("Preparing repository at %s", root)
 
     plan = _detect_plan(root)
     plan_path = _write_plan(root, plan)
-    logger.info("Wrote plan: %s (kind=%s)", plan_path, plan.get("kind"))
+    plan_h = _plan_hash(plan)
 
-    # 1) OS-level deps check
-    os_deps = plan.get("os_deps") or {}
-    missing_req = _missing_bins(list(os_deps.get("bins_required") or []))
-    if missing_req:
-        raise RuntimeError(
-            f"missing-os-deps: required binaries not found on PATH: {missing_req}"
-        )
+    logger.info(
+        "Wrote plan: %s (kind=%s, plan_hash=%s)", plan_path, plan.get("kind"), plan_h
+    )
 
-    missing_opt = _missing_bins(list(os_deps.get("bins_optional") or []))
-    if missing_opt:
-        logger.warning(
-            "Optional binaries not found (may reduce success rate): %s", missing_opt
-        )
+    progress = _load_progress(root)
 
-    # 2) Language-level prep
+    # 1) OS-level deps check (recorded so it won't re-run once successful)
+    def _os_deps_check() -> None:
+        os_deps = plan.get("os_deps") or {}
+        missing_req = _missing_bins(list(os_deps.get("bins_required") or []))
+        if missing_req:
+            raise RuntimeError(
+                f"missing-os-deps: required binaries not found on PATH: {missing_req}"
+            )
+
+        missing_opt = _missing_bins(list(os_deps.get("bins_optional") or []))
+        if missing_opt:
+            logger.warning(
+                "Optional binaries not found (may reduce success rate): %s", missing_opt
+            )
+
+    _run_recorded_step(
+        root=root,
+        progress=progress,
+        plan_h=plan_h,
+        name="os_deps.check",
+        payload={
+            "bins_required": (plan.get("os_deps") or {}).get("bins_required", []),
+            "bins_optional": (plan.get("os_deps") or {}).get("bins_optional", []),
+        },
+        fn=_os_deps_check,
+    )
+
+    # 2) Language-level prep (record each command, so successful ones never re-run)
     env = plan.get("env") or {"CI": "1"}
     timeout_sec = int(plan.get("timeout_sec") or DEFAULT_TIMEOUT_SEC)
     kind = str(plan.get("kind") or "")
@@ -504,6 +732,8 @@ def prepare_repo(repo_root: str) -> dict[str, Any]:
         auto = plan.get("autotools") or {}
         _autotools_bootstrap(
             root,
+            progress=progress,
+            plan_h=plan_h,
             needs_autoreconf=bool(auto.get("needs_autoreconf")),
             needs_libtoolize=bool(auto.get("needs_libtoolize")),
             timeout_sec=timeout_sec,
@@ -511,17 +741,25 @@ def prepare_repo(repo_root: str) -> dict[str, Any]:
             base_env=env,
         )
     else:
-        # generic execution for node/python/etc
-        for cmd in plan.get("prepare") or []:
-            logger.info("Prepare cmd: %s", cmd)
-            try:
-                _run_cmd(cmd, cwd=root, env=env, timeout_sec=timeout_sec, check=True)
-            except RuntimeError:
-                # keep your prior behavior: pip upgrade failures are non-fatal
-                if kind == "python" and cmd[-3:] == ["install", "--upgrade", "pip"]:
-                    logger.warning("pip upgrade failed; continuing with existing pip.")
-                    continue
-                raise
+        for i, cmd in enumerate(plan.get("prepare") or []):
+            # Preserve your prior behavior: pip upgrade failures are non-fatal,
+            # but now we also mark them OK so we don't spam/retry every run.
+            nonfatal = False
+            if kind == "python" and cmd[-3:] == ["install", "--upgrade", "pip"]:
+                nonfatal = True
+
+            _run_recorded_cmd(
+                root=root,
+                progress=progress,
+                plan_h=plan_h,
+                name=f"prepare.{i}",
+                cmd=cmd,
+                cwd=root,
+                env=env,
+                timeout_sec=timeout_sec,
+                check=True,
+                nonfatal=nonfatal,
+            )
 
     logger.info("Repository preparation complete.")
     return plan

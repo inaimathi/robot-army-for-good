@@ -1,12 +1,13 @@
 # pbt.py
 import json
+import os.path
 import sys
 import time
 from os import environ as ENV
 from pathlib import Path
 from string import Template
 from types import TracebackType
-from typing import Any
+from typing import Any, Optional
 
 from trivialai import bedrock, ollama, util
 from trivialai.agent import toolbox
@@ -33,31 +34,40 @@ CHECKPOINT = "pbt.checkpoint"
 
 
 def main(repo_path):
-    return force(run_pbt_test(str(Path(repo_path).expanduser().resolve())))
+    logger.info(f"Running on {repo_path}...")
+    full_path = str(Path(repo_path).expanduser().resolve())
+    prepare.prepare_repo(full_path)
+    logger.info(f"   Repo prepared {repo_path}...")
+    return force(run_pbt_test(full_path, agent_name=os.path.basename(repo_path)))
 
 
-def run_pbt_test(path: str):
+def run_pbt_test(path: str, agent_name: Optional[str] = None):
     repo_root = path
     src_files = toolbox.code_ls(path)
     reports: list[str] = []
+
+    logger.info(f"Running test. Full source is {len(src_files)} files...")
+
+    if agent_name is None:
+        agent_name = AGENT_NAME
 
     system = util.slurp("resources/pbt_prompt.md")
     agent = pbtagent.PBTAgent(
         LLM,
         repo_root,
         system=system,
-        name=AGENT_NAME,
+        name=agent_name,
     )
 
     candidates = LLM.generate_checked(
         util.json_shape([str]),
-        util.slurp(
-            "/home/inaimathi/projects/robot-army-for-good/resources/pbt_prompt.md"
-        ),
-        f"The repo's file list is {toolbox.code_ls('/home/inaimathi/projects/codemirror')}. Given that structure, return the list of files likely to contain bugs in descending order of priority. Your response must be a JSON array of type [String] with no other commentary.",
+        util.slurp("resources/pbt_prompt.md"),
+        f"The repo's file list is {src_files}. Given that structure, return the list of files likely to contain bugs in descending order of priority. Your response must be a JSON array of type [String] with no other commentary.",
     ).content
     src_files_set = set(src_files)
     likely_src = [c for c in candidates if c in src_files_set]
+
+    logger.info(f"Identified {len(likely_src)} candidate files...")
 
     def _per_file_stream(f: str):
         started = time.time()
