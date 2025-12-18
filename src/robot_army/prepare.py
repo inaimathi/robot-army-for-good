@@ -149,7 +149,7 @@ def _autotools_env(
     env.setdefault("LANG", "C")
     env.setdefault("LC_ALL", "C")
 
-    existing = os.environ.get("ACLOCAL_PATH", "")
+    existing = env.get("ACLOCAL_PATH") or os.environ.get("ACLOCAL_PATH", "")
     existing_parts = [p for p in existing.split(":") if p]
     new_parts = _unique_paths(add_aclocal_dirs + existing_parts)
     if new_parts:
